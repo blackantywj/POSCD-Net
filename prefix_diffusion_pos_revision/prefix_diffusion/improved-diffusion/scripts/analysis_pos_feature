@@ -1,0 +1,237 @@
+"""
+Generate a large batch of image samples from a model and save them as a large
+numpy array. This can be used to produce samples for FID evaluation.
+"""
+
+import argparse
+import os, json, sys
+import numpy as np
+import torch as th
+from torch import nn
+from transformers import set_seed
+import torch.distributed as dist
+from improved_diffusion.rounding import rounding_func, rounding_func_pos, load_models, load_tokenizer
+from improved_diffusion.test_util import get_weights, denoised_fn_round, denoised_fn_round_pos
+from functools import partial
+from improved_diffusion import dist_util, logger
+from improved_diffusion.script_util import (
+    NUM_CLASSES,
+    model_and_diffusion_defaults,
+    create_model_and_diffusion,
+    add_dict_to_argparser,
+    args_to_dict,
+)
+sys.path.insert(0, '../transformers/examples/pytorch/language-modeling')
+# from custom_trainer import Classifier_GPT2, Classifier_Times, Classifier_POS, Classifier_Tree,Classifier_image
+from infill_util import langevin_fn3, get_score, langevin_fn3_compose, langevin_fn1, langevin_fn4, langevin_fn_tree, langevin_fn_length
+from spacy.lang.en import English
+# sys.path.append("clip/")
+# from model_creation import create_clip_model
+from torchvision import transforms
+from torchvision.transforms import functional as TF
+from torch.nn import functional as F
+import clip
+import pdb
+import pickle
+import json
+from PIL import Image
+from tqdm import tqdm
+from tqdm.contrib import tzip
+import skimage.io as io
+from pycocotools.coco import COCO
+from pycocoevalcap.eval import COCOEvalCap
+from eval_metrics import sentence_pro
+from eval_metrics import ref_pro
+from eval_metrics import calculate_distinct
+from eval_metrics import clip_choose
+
+
+def main():
+    set_seed(1234)
+    args = create_argparser().parse_args()
+    assert os.path.exists(args.out_dir)==True
+    # pdb.set_trace()
+    # load configurations.
+    config_path = os.path.join(os.path.split(args.model_path)[0], "training_args.json")
+    print(config_path)
+    # sys.setdefaultencoding('utf-8')
+    with open(config_path, 'rb', ) as f:
+        training_args = json.load(f)
+    vocab_path = os.path.join(os.path.split(args.model_path)[0], "vocab.json")
+    with open(vocab_path, 'rb', ) as f:
+        vocab_dict = json.load(f)
+    args.__dict__.update(training_args)
+    device = th.device("cuda" if th.cuda.is_available() else "cpu")
+    args.noise_level = 0.0
+    args.sigma_small = True
+
+    if args.eval_task_.startswith('control_'):
+        args.diffusion_steps = 1000  # 500  # DEBUG
+    dist_util.setup_dist()
+    logger.configure()
+    print(args.clip_denoised, 'clip_denoised')  # args.clip_denoised=False
+    logger.log("creating model and diffusion...")
+    model, diffusion = create_model_and_diffusion(
+        **args_to_dict(args, model_and_diffusion_defaults().keys())
+    )
+    # model.load_state_dict(th.load(args.model_path))
+    model.to(dist_util.dev())
+    model.eval()
+    args.batch_size = 100
+    logger.log("load embedding models")
+    print(os.path.split(args.model_path)[0])
+    # args.modality=e2e-tgt,experiment=random,model_name_or_path=predictability/diff_models/compress_e=5_b=60_m=gpt2_wikitext-103-raw-v1_None
+    # in_channel=16 os.path.split(model_path)[0]=diffusion_models/diff_e2e-tgt_block_rand16_transformer_lr0.0001_0.0_2000_sqrt_Lsimple_h128_s2_d0.1_sd102_xstart_e2e
+    pos_embs, model_embs, tokenizer = load_models(args.modality, args.experiment, args.model_name_or_path, args.in_channel,
+                                   os.path.split(args.model_path)[0])
+    if args.training_mode.startswith('e2e'):    # args.training_mode=e2e
+        print('e2e, load the right model embeddings', '*'*80)
+        model_embs.weight = th.nn.Parameter(model.word_embedding.weight.clone().cpu())
+        pos_embs.weight = th.nn.Parameter(model.posEmbedding.weight.clone().cpu())
+    model_embs = model_embs.cuda()  # model_embs=Embedding(821,16)
+    pos_embs = pos_embs.cuda()
+    # model3 = get_weights(model_embs, args)  # model3 = Embedding(821,16)
+    # model4 = get_weights(pos_embs, args)
+    model.load_state_dict(th.load("/home/cumt/wjworkspace/prefix_diffusion_pos_revision/prefix_diffusion/improved-diffusion/diffusion_model/coco/0110/ema_0.9999_200000.pt"))
+    logger.log("sampling...")
+    sample_dict = {}
+    img_path= "/home/cumt/wjworkspace/prefix_diffusion_pos_revision/prefix_diffusion/improved-diffusion/datasets/coco_vit_L14/knn_vit_pos13_coco_test_text_img_512_prepos20.pkl"
+    with open(img_path, 'rb') as ff:
+        all_data = pickle.load(ff)
+    print("data size is%0d" % len(all_data['captions']))
+    captions_raw = all_data['captions'][0:len(all_data['captions'])]
+    img_lst = [caption['img'] for caption in captions_raw]
+    id_lst = [caption['img_id'] for caption in captions_raw]
+    imgbu_lst = [caption['imgbu'] for caption in captions_raw]
+    word_list = [caption['tokens'] for caption in captions_raw]
+    pos_list = [caption['pos'] for caption in captions_raw]
+    pos_list_np = np.array(pos_list)
+    result = []
+    for item in pos_list_np:
+        s = []
+        for i in item:
+            s.append(np.where(i==6))
+        result.append(s)
+    posemb = model.posEmbedding
+    posembtensor = th.Tensor().to("cuda:0")
+    for ilist in pos_list:
+        posembtensor1 = th.Tensor().to("cuda:0")
+        for pos in ilist:
+            posembitem = posemb(th.LongTensor(list(pos)).unsqueeze(0).to("cuda:0"))
+            posembtensor1 = th.cat((posembtensor1, posembitem), dim=0)    
+        posembtensor = th.cat((posembtensor, posembtensor1), dim=0)    
+    # posembnumpy = posembtensor[0:1000]
+    # posembnumpyresult = th.Tensor().to("cuda:0")
+    # for i, list1 in enumerate(result[0:1000]):
+    #     for j in list1:
+    #         for k in j[0]:
+    #             posembnumpyresult = th.cat((posembnumpyresult, posembnumpy[i][k].unsqueeze(0)), dim=0)    
+    th.save(posembtensor.reshape((5002, -1)), "posemb.pt")
+    wordemb = model.word_embedding
+    wordembtensor = th.Tensor().to("cuda:0")
+    for slistlist in word_list:
+        wordembtensor1 = th.Tensor().to("cuda:0")
+        for slist in slistlist:
+            wlist = [vocab_dict.get(x, vocab_dict['UNK']) for x in slist]
+            wlist = pad_list_with_zeros(wlist)
+            wordembitem = wordemb(th.LongTensor(wlist).unsqueeze(0).to("cuda:0"))
+            wordembtensor1 = th.cat((wordembtensor1, wordembitem), dim=0)    
+        wordembtensor = th.cat((wordembtensor, wordembtensor1), dim=0)    
+    # wordembnumpy = wordembtensor[0:1000]
+    # wordembnumpyresult = th.Tensor().to("cuda:0")
+    # for i, list1 in enumerate(result[0:1000]):
+    #     for j in list1:
+    #         for k in j[0]:
+    #             wordembnumpyresult = th.cat((wordembnumpyresult, wordembnumpy[i][k].unsqueeze(0)), dim=0)    
+    th.save(wordembtensor[:,:30].reshape((5002, -1)), "wordemb.pt")    
+    crossatt = model.condCrossAtt
+    cond_pos_xembtensor = th.Tensor().to("cuda:0")
+    cond_pos_x = crossatt(wordembtensor[:, 0:30], posembtensor)
+    # for i, list1 in enumerate(result[0:1000]):
+    #     for j in list1:
+    #         for k in j[0]:
+    #             cond_pos_xembtensor = th.cat((cond_pos_xembtensor, cond_pos_x[i][k].unsqueeze(0)), dim=0)    
+    th.save(cond_pos_x.reshape((5002, -1)), "fuswordemb.pt") 
+    # fusionfeature = 
+    return args
+
+def pad_list_with_zeros(lst):  
+    # 获取当前列表的长度  
+    length = len(lst)  
+      
+    # 如果列表长度小于30，补充0到长度为30  
+    if length < 50:  
+        lst.extend([0] * (50 - length))  
+      
+    # 返回可能已经被修改或者未被修改的列表  
+    return lst
+
+def create_argparser():
+    defaults = dict(
+        data_dir="", clip_denoised=False, use_ddim=False, eta=1.0, num_samples=100, batch_size=1, model_path="",
+        out_dir="/home/cumt/wjworkspace/prefix_diffusion_pos_revision/prefix_diffusion/improved-diffusion/generation_out/coco/1230/20ttt/",
+        emb_scale_factor=1.0, split='train', debug_path='', eval_task_='infill',
+        partial_seq="", partial_seq_file="", verbose='yes', tgt_len=15, t_merge=200, interp_coef=0.5, notes='',
+        start_idx=0, end_idx=0,
+    )
+    defaults.update(model_and_diffusion_defaults())
+    parser = argparse.ArgumentParser()
+    add_dict_to_argparser(parser, defaults)
+    return parser
+
+
+def eval_oracle(preds_n):
+    
+    cache_path = os.path.join('/home/cumt/wjworkspace/prefix_diffusion_pos_revision/prefix_diffusion/improved-diffusion/generation_out/coco/1230/20ttt/1230_ema_0.9999_200000.pt.json')
+    annFile = "/home/cumt/wjworkspace/prefix_diffusion_pos_revision/prefix_diffusion/improved-diffusion/datasets/coco/test_ref_coco.json"
+    coco = COCO(annFile)
+
+    capsById = {}
+    for d in preds_n:
+        capsById[d['image_id']] = capsById.get(d['image_id'], []) + [d]
+    
+    # sample_n = capsById[list(capsById.keys())[0]]
+    for i in range(len(capsById[list(capsById.keys())[0]])):
+        preds = [_[i] for _ in capsById.values()]
+
+        json.dump(preds, open(cache_path, 'w')) # serialize to temporary json file. Sigh, COCO API...
+
+        cocoRes = coco.loadRes(cache_path)
+        cocoEval = COCOEvalCap(coco, cocoRes)
+        cocoEval.params['image_id'] = cocoRes.getImgIds()
+        cocoEval.evaluate()
+
+        imgToEval = cocoEval.imgToEval
+        for img_id in capsById.keys():
+            tmp = imgToEval[img_id]
+            for k in tmp['SPICE'].keys():
+                if k != 'All':
+                    tmp['SPICE_'+k] = tmp['SPICE'][k]['f']
+                    if tmp['SPICE_'+k] != tmp['SPICE_'+k]: # nan
+                        tmp['SPICE_'+k] = -100
+            tmp['SPICE'] = tmp['SPICE']['All']['f']
+            if tmp['SPICE'] != tmp['SPICE']: tmp['SPICE'] = -100
+            capsById[img_id][i]['scores'] = imgToEval[img_id]
+
+    out = {'overall': {}, 'ImgToEval': {}}
+    for img_id in capsById.keys():
+        out['ImgToEval'][img_id] = {}
+        for metric in capsById[img_id][0]['scores'].keys():
+            if metric == 'image_id': continue
+            out['ImgToEval'][img_id]['oracle_'+metric] = max([_['scores'][metric] for _ in capsById[img_id]])
+            out['ImgToEval'][img_id]['avg_'+metric] = sum([_['scores'][metric] for _ in capsById[img_id]]) / len(capsById[img_id])
+        out['ImgToEval'][img_id]['captions'] = capsById[img_id]
+    for metric in list(out['ImgToEval'].values())[0].keys():
+        if metric == 'captions':
+            continue
+        tmp = np.array([_[metric] for _ in out['ImgToEval'].values()])
+        tmp = tmp[tmp!=-100]
+        out['overall'][metric] = tmp.mean()
+    with open("record100.txt", "w") as file:
+        file.write(str(out))
+    return out
+
+if __name__ == "__main__":
+    args = main()
+
+
